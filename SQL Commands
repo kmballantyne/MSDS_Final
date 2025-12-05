@@ -1,0 +1,349 @@
+Checking to see if synthetic_train data table has any rows from the file paths of naturally transformed images instead of the desired synthetic images.
+
+SELECT COUNT(*) AS natural_count
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+WHERE REGEXP_CONTAINS(Path, r'/natural/');
+
+Same kind of command but in reverse.
+
+SELECT COUNT(*) AS bad_rows
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+WHERE NOT REGEXP_CONTAINS(Path, r'/synthetic/');
+
+Confirming patient modality (i.e. the patients in the synthetic transformations have both digital and photographic transformations).  SELECT patient_id, COUNT(DISTINCT modality) AS modality_count
+FROM (
+  SELECT
+    REGEXP_EXTRACT(Path, r'(patient[0-9]+)') AS patient_id,
+    CASE
+      WHEN REGEXP_CONTAINS(Path, r'/synthetic/digital/') THEN 'digital'
+      WHEN REGEXP_CONTAINS(Path, r'/synthetic/photographic/') THEN 'photo'
+      WHEN REGEXP_CONTAINS(Path, r'/natural/') THEN 'natural'
+      ELSE 'other'
+    END AS modality
+  FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+)
+GROUP BY patient_id
+HAVING modality_count > 1;
+
+Checking if the split between digital and photographic transformations were clean.  SELECT COUNT(*) AS n
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+WHERE REGEXP_CONTAINS(Path, r'/synthetic/digital/');
+
+SELECT COUNT(*) AS n
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+WHERE REGEXP_CONTAINS(Path, r'/synthetic/photographic/');
+
+Counting unique patients in synthetic train (expecting 3000). It returned 3000.
+
+SELECT COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]{5})')) AS unique_patients
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`;
+
+Checking whether all patient IDs follow the 5-digit pattern patientXXXXX. Return nothing so all patients have 5 digit IDs.
+
+SELECT DISTINCT 
+  REGEXP_EXTRACT(Path, r'(patient[0-9]+)') AS patient_id
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+WHERE NOT REGEXP_CONTAINS(Path, r'patient[0-9]{5}')
+
+Checking to see balanced patient representation and how many images are associated with each patient.
+
+SELECT 
+  patient_id, 
+  COUNT(*) AS num_images
+FROM (
+  SELECT 
+    REGEXP_EXTRACT(Path, r'(patient[0-9]+)') AS patient_id
+  FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+)
+GROUP BY patient_id
+ORDER BY num_images DESC
+LIMIT 10;
+
+Creating synthetic digital table.
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_global.synthetic_train_digital` AS
+SELECT *
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+WHERE REGEXP_CONTAINS(Path, r'/synthetic/digital/');
+
+Creating synthetic photographic table.
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_global.synthetic_train_photo` AS
+SELECT *
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+WHERE REGEXP_CONTAINS(Path, r'/synthetic/photographic/');
+
+Both of these new tables have 10,507 entries each.
+
+Checking number of patients in each image transformation modalities.
+
+Digital transformations only.
+
+SELECT COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)')) 
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train_digital`;
+
+Photographic transformations only.
+
+SELECT COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)')) 
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train_photo`;
+
+Intersection of both digital and photographic transformations.
+
+WITH digital AS (
+  SELECT DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)') AS patient_id
+  FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+  WHERE REGEXP_CONTAINS(Path, r'/synthetic/digital/')
+),
+photo AS (
+  SELECT DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)') AS patient_id
+  FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+  WHERE REGEXP_CONTAINS(Path, r'/synthetic/photographic/')
+)
+SELECT COUNT(*) AS overlap_patients
+FROM (
+  SELECT patient_id FROM digital
+  INTERSECT DISTINCT
+  SELECT patient_id FROM photo
+);
+
+It seems like there are no modality-unique patients.
+
+Creating unique patient index for client partitioning.
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_global.patient_index` AS
+WITH patients AS (
+  SELECT DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)') AS patient_id
+  FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train`
+),
+numbered AS (
+  SELECT
+    patient_id,
+    ROW_NUMBER() OVER (ORDER BY FARM_FINGERPRINT(patient_id)) AS rn
+  FROM patients
+)
+SELECT * FROM numbered;
+
+Creating unique patient index for client partitioning for validation set.
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_global.patient_index_valid` AS
+WITH patients AS (
+  SELECT DISTINCT
+    REGEXP_EXTRACT(Path, r'(patient[0-9]+)') AS patient_id
+  FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_valid`
+),
+numbered AS (
+  SELECT
+    patient_id,
+    ROW_NUMBER() OVER (ORDER BY FARM_FINGERPRINT(patient_id)) AS rn
+  FROM patients
+)
+SELECT * FROM numbered;
+
+Sanity check for making sure index was creating correctly. Returned min_rn = 1, max_rn = 3000, n_patients = 3000
+
+SELECT COUNT(*) AS n_patients,
+       MIN(rn) AS min_rn,
+       MAX(rn) AS max_rn
+FROM `chexphoto-thesis-479905.chexphoto_global.patient_index`;
+
+Sanity check for making sure index was created correctly for validation set. Returned min_rn = 1, max_rn = 200, n_patients = 200
+
+SELECT
+  COUNT(*) AS n_patients,
+  MIN(rn) AS min_rn,
+  MAX(rn) AS max_rn
+FROM `chexphoto-thesis-479905.chexphoto_global.patient_index_valid`;
+
+Creating and partitioning data for each client on training data.
+
+Client 1 - digital, patients rn 1-600
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client1_train` AS
+SELECT t.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train` AS t
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index` AS p
+  ON REGEXP_EXTRACT(t.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 1 AND 600
+  AND REGEXP_CONTAINS(t.Path, r'/synthetic/digital/');
+
+Client 2 - digital, patients rn 601-1200
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client2_train` AS
+SELECT t.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train` AS t
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index` AS p
+  ON REGEXP_EXTRACT(t.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 601 AND 1200
+  AND REGEXP_CONTAINS(t.Path, r'/synthetic/digital/');
+
+Client 3 - photographic, patients rn 1201-1800
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client3_train` AS
+SELECT t.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train` AS t
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index` AS p
+  ON REGEXP_EXTRACT(t.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 1201 AND 1800
+  AND REGEXP_CONTAINS(t.Path, r'/synthetic/photographic/');
+
+Client 4 - photographic, patients rn 1801-2400
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client4_train` AS
+SELECT t.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train` AS t
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index` AS p
+  ON REGEXP_EXTRACT(t.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 1801 AND 2400
+  AND REGEXP_CONTAINS(t.Path, r'/synthetic/photographic/');
+
+Client 5 - mixed digital & photographic, patients rn 2401-2700;2701-3000
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client5_train` AS
+-- digital part
+SELECT t.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train` AS t
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index` AS p
+  ON REGEXP_EXTRACT(t.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 2401 AND 2700
+  AND REGEXP_CONTAINS(t.Path, r'/synthetic/digital/')
+
+UNION ALL
+
+-- photo part
+SELECT t.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_train` AS t
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index` AS p
+  ON REGEXP_EXTRACT(t.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 2701 AND 3000
+  AND REGEXP_CONTAINS(t.Path, r'/synthetic/photographic/');
+
+Number of rows for each client metadata.
+Client 1:
+Client 2:
+Client 3:
+Client 4:
+Client 5:
+
+Creating and partitioning data for each client on validation data.
+
+Client 1 valid - digital, patients rn 1-40
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client1_valid` AS
+SELECT v.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_valid` AS v
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index_valid` AS p
+  ON REGEXP_EXTRACT(v.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 1 AND 40
+  AND REGEXP_CONTAINS(v.Path, r'/synthetic/digital/');
+
+Client 2 valid - digital, patients rn 41-80
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client2_valid` AS
+SELECT v.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_valid` AS v
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index_valid` AS p
+  ON REGEXP_EXTRACT(v.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 41 AND 80
+  AND REGEXP_CONTAINS(v.Path, r'/synthetic/digital/');
+
+Client 3 valid - photographic, patients rn 81-120
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client3_valid` AS
+SELECT v.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_valid` AS v
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index_valid` AS p
+  ON REGEXP_EXTRACT(v.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 81 AND 120
+  AND REGEXP_CONTAINS(v.Path, r'/synthetic/photographic/');
+
+Client 4 valid - photographic, patients rn 121-160
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client4_valid` AS
+SELECT v.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_valid` AS v
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index_valid` AS p
+  ON REGEXP_EXTRACT(v.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 121 AND 160
+  AND REGEXP_CONTAINS(v.Path, r'/synthetic/photographic/');
+
+Client 5 valid - mixed digital & photographic, patients rn 161-180;181-200
+
+CREATE OR REPLACE TABLE `chexphoto-thesis-479905.chexphoto_clients.client5_valid` AS
+-- digital patients (rn 161–180)
+SELECT v.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_valid` AS v
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index_valid` AS p
+  ON REGEXP_EXTRACT(v.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 161 AND 180
+  AND REGEXP_CONTAINS(v.Path, r'/synthetic/digital/')
+
+UNION ALL
+
+-- photo patients (rn 181–200)
+SELECT v.*
+FROM `chexphoto-thesis-479905.chexphoto_global.synthetic_valid` AS v
+JOIN `chexphoto-thesis-479905.chexphoto_global.patient_index_valid` AS p
+  ON REGEXP_EXTRACT(v.Path, r'(patient[0-9]+)') = p.patient_id
+WHERE p.rn BETWEEN 181 AND 200
+  AND REGEXP_CONTAINS(v.Path, r'/synthetic/photographic/');
+
+Patient per client sanity check. Each client returns 600 patients each.
+
+SELECT 'client1' AS client, COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)')) AS patients
+FROM `chexphoto-thesis-479905.chexphoto_clients.client1_train`
+UNION ALL
+SELECT 'client2', COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)'))
+FROM `chexphoto-thesis-479905.chexphoto_clients.client2_train`
+UNION ALL
+SELECT 'client3', COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)'))
+FROM `chexphoto-thesis-479905.chexphoto_clients.client3_train`
+UNION ALL
+SELECT 'client4', COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)'))
+FROM `chexphoto-thesis-479905.chexphoto_clients.client4_train`
+UNION ALL
+SELECT 'client5', COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)'))
+FROM `chexphoto-thesis-479905.chexphoto_clients.client5_train`;
+
+Patient per valid client sanity check. Each client returns 40 patients each.
+
+SELECT 'client1_valid' AS split,
+       COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)')) AS n_patients
+FROM `chexphoto-thesis-479905.chexphoto_clients.client1_valid`
+UNION ALL
+SELECT 'client2_valid',
+       COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)'))
+FROM `chexphoto-thesis-479905.chexphoto_clients.client2_valid`
+UNION ALL
+SELECT 'client3_valid',
+       COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)'))
+FROM `chexphoto-thesis-479905.chexphoto_clients.client3_valid`
+UNION ALL
+SELECT 'client4_valid',
+       COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)'))
+FROM `chexphoto-thesis-479905.chexphoto_clients.client4_valid`
+UNION ALL
+SELECT 'client5_valid',
+       COUNT(DISTINCT REGEXP_EXTRACT(Path, r'(patient[0-9]+)'))
+FROM `chexphoto-thesis-479905.chexphoto_clients.client5_valid`;
+
+Modality check per client on the training dataset.
+
+SELECT
+  SUM(CASE WHEN REGEXP_CONTAINS(Path, r'/synthetic/digital/') THEN 1 ELSE 0 END) AS digital_images,
+  SUM(CASE WHEN REGEXP_CONTAINS(Path, r'/synthetic/photographic/') THEN 1 ELSE 0 END) AS photo_images
+FROM `chexphoto-thesis-479905.chexphoto_clients.client1_train`;
+
+Okay so from here I have the synthetic training and validation datasets. 
+
+Another note is that some patients have many images associated with them while others do not.
+
+SELECT patient_id, COUNT(*) AS num_images FROM ( SELECT REGEXP_EXTRACT(Path, r'(patient[0-9]+)') AS patient_id FROM chexphoto-thesis-479905.chexphoto_global.synthetic_train ) GROUP BY patient_id ORDER BY num_images DESC;
+
+This returned an output that showed the distribution and range of the amount of images that are associated with each patient.
+I looked at both extremes and observed that the range of the number of images for each patient spans from a maximum of 186 to a minimum of 2. Perhaps certain patients were involved in more studies. But after removing LIMIT 10 there still were 3000 rows returned total.
+CheXpert indeed has highly variable numbers of radiographs per patient, sometimes due to:
+* multiple hospital visits
+* multiple studies per visit
+* studies with multiple views
+* synthetic augmentation applied per-view
+So the 2–186 image range is normal.
